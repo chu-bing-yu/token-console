@@ -1,0 +1,13 @@
+{
+  "id": "token-console",
+  "name": "Token 控制台",
+  "version": "1.0.0",
+  "description": "观察 AI 请求的模型、输入/输出 token、DeepSeek 缓存命中与费用，并在聊天 + 面板里做 token 试算。",
+  "author": "chu-bing-yu",
+  "entry": "https://raw.githubusercontent.com/chu-bing-yu/token-console/main/plugin.js",
+  "hash": "",
+  "permissions": [
+    "storage",
+    "ui"
+  ]
+}
