@@ -1,17 +1,18 @@
 /*!
- * token-console v1.0.0 — Roche 插件
- * 观察页面发往 AI 服务的请求：模型、输入/输出 token、DeepSeek 缓存命中、预估费用、调用位置。
+ * token-console v1.1.0 — Roche 插件
+ * Token 账单：观察页面发往 AI 服务的请求（模型、输入/输出 token、DeepSeek 缓存命中、预估费用、调用位置）。
  * 只记录请求元信息（地址、模型、token 数、调用栈文件名/行号），不保存对话正文，不保存 API Key。
- * 价格：DeepSeek 官方公布价（元 / 百万 tokens），按北京时间高峰/空闲自动切换。
+ * 价格：DeepSeek 官方公布价（元 / 百万 tokens），按北京时间高峰 / 空闲自动切换。
  */
 (function () {
   'use strict';
 
-  var VERSION = '1.0.0';
+  var VERSION = '1.1.0';
   var STYLE_ID = 'rtc-style';
   var LOG_KEY = 'logs';
-  var THEME_KEY = 'theme';
-  var MAX_LOGS = 200;
+  var PURGED_KEY = 'purged';
+  var SETTINGS_KEY = 'settings';
+  var MAX_LOGS = 300;
   var SELF_SRC = (document.currentScript && document.currentScript.src) || '';
 
   /* ============================== 价格 ============================== */
@@ -51,7 +52,7 @@
   }
 
   function computeCost(rec) {
-    // 只对成功的聊天调用估价：生图/语音/向量按次或字符计费，失败请求不计费
+    // 只对成功的聊天调用估价：生图 / 语音 / 向量按次或字符计费，失败请求不计费
     if (!rec || !rec.deepseek || rec.kind !== 'chat' || !rec.ok) return null;
     var p = PRICING[rec.cls] || PRICING.flash;
     var band = rec.peak ? 'peak' : 'off';
@@ -78,16 +79,45 @@
     return '¥' + v.toFixed(2);
   }
 
+  function pad2(n) { return n < 10 ? '0' + n : String(n); }
+
   function fmtClock(ts) {
     var d = new Date(ts);
-    function p(n) { return n < 10 ? '0' + n : String(n); }
-    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
+  function fmtDay(ts) {
+    var d = new Date(ts);
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日';
   }
 
   function fmtMs(ms) {
     var v = Math.max(0, Math.round(Number(ms) || 0));
     if (v < 1000) return v + 'ms';
     return (v / 1000).toFixed(v < 10000 ? 1 : 0) + 's';
+  }
+
+  function dayKey(ts) {
+    var d = new Date(ts);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+  }
+
+  function dayStart(ts) {
+    var d = new Date(ts);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+
+  function dayEnd(ts) {
+    var d = new Date(ts);
+    d.setHours(23, 59, 59, 999);
+    return d.getTime();
+  }
+
+  function keyToTs(key) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(key || ''));
+    if (!m) return 0;
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
   }
 
   function textOfContent(content) {
@@ -139,22 +169,34 @@
 
   var ICONS = {
     sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.6 1.6M17.4 17.4L19 19M19 5l-1.6 1.6M6.6 17.4L5 19"/></svg>',
-    moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>',
-    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"/><path d="M10 11v6M14 11v6"/><path d="M7 7l1 13h8l1-13"/><path d="M9 7V4h6v3"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h9M17 17h3"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="15" cy="17" r="2"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-    calc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="4.5" y="3.5" width="15" height="17" rx="3"/><path d="M8 8h8"/><path d="M9 12.5h.01M12 12.5h.01M15 12.5h.01M9 16.5h.01M12 16.5h.01M15 16.5h.01"/></svg>'
+    bill: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3z"/><path d="M9 8h6M9 12h6"/></svg>'
   };
 
   var KIND_LABEL = { chat: '聊天', image: '生图', tts: '语音', embed: '向量' };
 
-  /* ============================== 日志缓冲 ============================== */
+  /* ============================== 状态 ============================== */
 
   var logs = [];
-  var subs = [];
+  var purged = {};
+  var settings = { range: 'today', start: '', end: '', theme: 'auto' };
   var store = null;
+  var hydratedFull = false;
+  var subs = [];
   var saveTimer = 0;
   var app = null;
-  var theme = 'auto';
+
+  function normalizeSettings(raw) {
+    var out = { range: 'today', start: '', end: '', theme: 'auto' };
+    if (!raw || typeof raw !== 'object') return out;
+    var ranges = ['today', '7d', '30d', 'all', 'custom'];
+    out.range = ranges.indexOf(raw.range) !== -1 ? raw.range : 'today';
+    out.start = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.start || '')) ? String(raw.start) : '';
+    out.end = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.end || '')) ? String(raw.end) : '';
+    out.theme = raw.theme === 'light' || raw.theme === 'dark' ? raw.theme : 'auto';
+    return out;
+  }
 
   function subscribe(fn) {
     subs.push(fn);
@@ -180,15 +222,182 @@
     if (!store || saveTimer) return;
     saveTimer = setTimeout(function () {
       saveTimer = 0;
-      saveLogs();
-    }, 1200);
+      flushSave();
+    }, 1000);
   }
 
-  function saveLogs() {
+  function flushSave() {
     if (!store) return;
     try {
       Promise.resolve(store.set(LOG_KEY, logs.slice(0, MAX_LOGS))).catch(function () {});
+      Promise.resolve(store.set(PURGED_KEY, purged)).catch(function () {});
+      Promise.resolve(store.set(SETTINGS_KEY, settings)).catch(function () {});
     } catch (e) { /* 存储不可用不影响记录 */ }
+  }
+
+  async function readLogsFrom(storageLike) {
+    if (!storageLike) return;
+    try {
+      var savedLogs = await storageLike.get(LOG_KEY);
+      if (Array.isArray(savedLogs)) logs = mergeLogs(savedLogs, logs);
+    } catch (e) { /* ignore */ }
+  }
+
+  async function hydrateApp(rocheLike) {
+    if (!rocheLike || !rocheLike.storage) return;
+    store = rocheLike.storage;
+    await readLogsFrom(store);
+    if (hydratedFull) return;
+    hydratedFull = true;
+
+    try {
+      var savedPurged = await store.get(PURGED_KEY);
+      if (savedPurged && typeof savedPurged === 'object' && !Array.isArray(savedPurged)) purged = savedPurged;
+    } catch (e) { /* ignore */ }
+
+    try {
+      var savedSettings = await store.get(SETTINGS_KEY);
+      if (savedSettings) settings = normalizeSettings(savedSettings);
+    } catch (e) { /* ignore */ }
+  }
+
+  /** 「+」面板只读：不清空全局 store，避免写到别的存储作用域 */
+  async function hydrateReadOnly(rocheLike) {
+    if (!rocheLike || !rocheLike.storage) return;
+    var storageLike = rocheLike.storage;
+    await readLogsFrom(storageLike);
+    if (hydratedFull) return;
+    try {
+      var savedPurged = await storageLike.get(PURGED_KEY);
+      if (savedPurged && typeof savedPurged === 'object' && !Array.isArray(savedPurged)) purged = savedPurged;
+    } catch (e) { /* ignore */ }
+  }
+
+  function mergeLogs(a, b) {
+    var seen = {};
+    var out = [];
+    a.concat(b).forEach(function (rec) {
+      if (!rec || !rec.id || seen[rec.id]) return;
+      seen[rec.id] = true;
+      rec.cost = computeCost(rec);
+      out.push(rec);
+    });
+    out.sort(function (x, y) { return (y.at || 0) - (x.at || 0); });
+    return out.slice(0, MAX_LOGS);
+  }
+
+  /* ============================== 统计 ============================== */
+
+  var RANGES = [
+    { id: 'today', label: '今天' },
+    { id: '7d', label: '近 7 天' },
+    { id: '30d', label: '近 30 天' },
+    { id: 'all', label: '全部' },
+    { id: 'custom', label: '自定义' }
+  ];
+
+  function resolveRange(cfg, now) {
+    var id = (cfg && cfg.range) || 'today';
+    var from = dayStart(now);
+    var to = dayEnd(now);
+    var label = '今天';
+
+    if (id === '7d') {
+      from = dayStart(now - 6 * 86400000);
+      label = '近 7 天';
+    } else if (id === '30d') {
+      from = dayStart(now - 29 * 86400000);
+      label = '近 30 天';
+    } else if (id === 'all') {
+      from = 0;
+      label = '全部';
+    } else if (id === 'custom') {
+      var s = keyToTs(cfg.start) || dayStart(now);
+      var e = keyToTs(cfg.end) || dayStart(now);
+      if (e < s) { var tmp = s; s = e; e = tmp; }
+      from = s;
+      to = dayEnd(e);
+      label = fmtDay(s) + ' - ' + fmtDay(e);
+    }
+
+    return { id: id, from: from, to: to, label: label };
+  }
+
+  function emptyStat() { return { calls: 0, fail: 0, prompt: 0, hit: 0, out: 0, cost: 0, priced: 0 }; }
+
+  function addRecord(stat, rec) {
+    stat.calls += 1;
+    if (!rec.ok) stat.fail += 1;
+    stat.prompt += num(rec.prompt);
+    stat.hit += num(rec.hit);
+    stat.out += num(rec.out);
+    if (rec.cost !== null && rec.cost !== undefined) {
+      stat.cost += rec.cost;
+      stat.priced += 1;
+    }
+  }
+
+  function addBucket(stat, bucket) {
+    if (!bucket) return;
+    stat.calls += num(bucket.calls);
+    stat.fail += num(bucket.fail);
+    stat.prompt += num(bucket.prompt);
+    stat.hit += num(bucket.hit);
+    stat.out += num(bucket.out);
+    stat.cost += num(bucket.cost);
+    stat.priced += num(bucket.priced);
+  }
+
+  function recordsIn(from, to) {
+    return logs.filter(function (rec) { return rec.at >= from && rec.at <= to; });
+  }
+
+  /** 统计 = 明细 + 已清除的日期汇总，所以清除明细后次数与 token 不变 */
+  function statsIn(from, to) {
+    var stat = emptyStat();
+    recordsIn(from, to).forEach(function (rec) { addRecord(stat, rec); });
+    Object.keys(purged).forEach(function (key) {
+      var ts = keyToTs(key);
+      if (!ts || ts < from || ts > to) return;
+      addBucket(stat, purged[key]);
+    });
+    return stat;
+  }
+
+  function purgedCallsIn(from, to) {
+    var total = 0;
+    Object.keys(purged).forEach(function (key) {
+      var ts = keyToTs(key);
+      if (!ts || ts < from || ts > to) return;
+      total += num(purged[key].calls);
+    });
+    return total;
+  }
+
+  /** 清除某个范围的明细：折叠进按天的汇总，统计总数保持不变 */
+  function purgeRange(from, to) {
+    var keep = [];
+    var removed = 0;
+    logs.forEach(function (rec) {
+      if (rec.at < from || rec.at > to) { keep.push(rec); return; }
+      removed += 1;
+      var key = dayKey(rec.at);
+      var bucket = purged[key] || { calls: 0, fail: 0, prompt: 0, hit: 0, out: 0, cost: 0, priced: 0 };
+      bucket.calls += 1;
+      if (!rec.ok) bucket.fail += 1;
+      bucket.prompt += num(rec.prompt);
+      bucket.hit += num(rec.hit);
+      bucket.out += num(rec.out);
+      if (rec.cost !== null && rec.cost !== undefined) {
+        bucket.cost += rec.cost;
+        bucket.priced += 1;
+      }
+      purged[key] = bucket;
+    });
+    logs = keep;
+    notify();
+    flushSave();
+    return removed;
   }
 
   /* ============================== 请求识别 ============================== */
@@ -197,7 +406,8 @@
     'deepseek', 'openai', 'anthropic', 'openrouter', 'siliconflow', 'moonshot',
     'bigmodel', 'groq', 'x.ai', 'volces', 'together.xyz', 'mistral', 'cohere',
     'stepfun', 'baichuan', 'lingyiwanwu', 'dashscope', 'minimax', 'hunyuan',
-    'perplexity', 'elevenlabs', 'generativelanguage', '302.ai', 'jina.ai'
+    'perplexity', 'elevenlabs', 'generativelanguage', '302.ai', 'jiuzhan',
+    'jina.ai', 'gemini'
   ];
 
   var AI_PATHS = [
@@ -206,7 +416,7 @@
     /audio\/(speech|transcriptions)/i, /text-to-speech/i, /\/responses/i
   ];
 
-  // 中转站/自建代理域名不固定，命中这些路径就直接当 AI 请求
+  // 中转站 / 自建代理域名不固定，命中这些路径就直接当 AI 请求
   var AI_PATHS_STRONG = [
     /chat\/completions/i, /chatcompletion/i, /generatecontent/i, /\/responses$/i
   ];
@@ -560,10 +770,9 @@
     '--rtc-warn:#ff8a80;--rtc-warn-bg:#3a201d;',
     '}',
     '.rtc-root *,.rtc-mask *{box-sizing:border-box;}',
-    '.rtc-root{display:flex;flex-direction:column;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;',
-    'background:var(--rtc-bg);color:var(--rtc-ink);font-family:var(--rtc-font);-webkit-font-smoothing:antialiased;}',
-    '.rtc-header{flex:0 0 auto;display:flex;align-items:flex-start;gap:10px;',
-    'padding:calc(10px + env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) 10px max(16px,env(safe-area-inset-left));}',
+    '.rtc-root{position:relative;display:flex;flex-direction:column;width:100%;height:100%;min-width:0;min-height:0;',
+    'overflow:hidden;background:var(--rtc-bg);color:var(--rtc-ink);font-family:var(--rtc-font);-webkit-font-smoothing:antialiased;}',
+    '.rtc-header{flex:0 0 auto;display:flex;align-items:flex-start;gap:10px;padding:12px 16px 8px;}',
     '.rtc-header__text{flex:1 1 auto;min-width:0;}',
     '.rtc-title{margin:0;font-size:17px;font-weight:600;letter-spacing:.01em;}',
     '.rtc-sub{margin:2px 0 0;font-size:11.5px;color:var(--rtc-muted);}',
@@ -573,8 +782,7 @@
     '.rtc-iconbtn:hover{background:var(--rtc-soft-2);}',
     '.rtc-iconbtn svg{width:17px;height:17px;}',
     '.rtc-iconbtn--close{background:transparent;}',
-    '.rtc-body{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;',
-    'padding:0 max(16px,env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left));}',
+    '.rtc-body{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:0 16px 20px;}',
     '.rtc-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}',
     '.rtc-tile{display:flex;flex-direction:column;gap:1px;padding:9px 4px;border-radius:var(--rtc-radius);',
     'background:var(--rtc-soft);text-align:center;}',
@@ -585,11 +793,13 @@
     '.rtc-chip{padding:5px 10px;border:1px solid var(--rtc-line);border-radius:999px;background:transparent;',
     'color:var(--rtc-muted);font:500 11.5px/1 var(--rtc-font);cursor:pointer;}',
     '.rtc-chip.is-active{background:var(--rtc-accent);border-color:var(--rtc-accent);color:var(--rtc-on-accent);}',
-    '.rtc-link{flex:0 0 auto;padding:6px 2px;border:0;background:none;color:var(--rtc-ink-2);',
-    'font:500 11.5px/1 var(--rtc-font);text-decoration:underline;text-underline-offset:3px;cursor:pointer;}',
+    '.rtc-rangebtn{flex:0 0 auto;display:inline-flex;align-items:center;gap:3px;padding:5px 2px;border:0;background:none;',
+    'color:var(--rtc-ink-2);font:500 11.5px/1 var(--rtc-font);cursor:pointer;}',
+    '.rtc-rangebtn::after{content:"▾";font-size:10px;opacity:.6;margin-left:1px;}',
     '.rtc-list{min-height:0;}',
     '.rtc-row{padding:10px 2px;border-bottom:1px solid var(--rtc-line);cursor:pointer;}',
     '.rtc-row:last-child{border-bottom:0;}',
+    '.rtc-row--mini{cursor:default;padding:8px 2px;}',
     '.rtc-row__head{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}',
     '.rtc-row__time{font-size:12px;font-variant-numeric:tabular-nums;}',
     '.rtc-row__badge{padding:1px 6px;border-radius:999px;background:var(--rtc-soft-2);color:var(--rtc-ink-2);font-size:10px;}',
@@ -605,39 +815,33 @@
     '.rtc-row.is-open .rtc-row__detail{display:block;}',
     '.rtc-empty{padding:34px 8px;text-align:center;color:var(--rtc-muted);font-size:12px;line-height:1.9;}',
     '.rtc-empty div:last-child{margin-top:4px;font-size:11px;opacity:.85;}',
+    '.rtc-footmargin{margin:10px 0 0;font-size:10.5px;color:var(--rtc-muted);text-align:center;}',
     '.rtc-pricebar{margin:12px 0 0;padding:8px 10px;border-radius:10px;background:var(--rtc-soft);',
     'font-size:10px;line-height:1.7;color:var(--rtc-muted);white-space:pre-line;}',
-    '.rtc-note{margin:14px 0 0;font-size:10.5px;line-height:1.7;color:var(--rtc-muted);}',
+    '.rtc-note{margin:10px 0 0;font-size:10.5px;line-height:1.7;color:var(--rtc-muted);}',
     '.rtc-mask{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;',
     'padding:24px;background:rgba(18,19,22,.38);font-family:var(--rtc-font);animation:rtc-fade .15s ease;}',
     '@keyframes rtc-fade{from{opacity:0}to{opacity:1}}',
-    '.rtc-dialog{display:flex;flex-direction:column;width:100%;max-width:330px;max-height:82vh;padding:18px 16px 14px;',
+    '.rtc-dialog{display:flex;flex-direction:column;width:100%;max-width:340px;max-height:82vh;padding:18px 16px 14px;',
     'border-radius:20px;background:var(--rtc-bg);color:var(--rtc-ink);box-shadow:0 18px 44px rgba(17,18,20,.2);',
     'animation:rtc-pop .16s ease;}',
     '@keyframes rtc-pop{from{transform:translateY(6px) scale(.98);opacity:.6}to{transform:none;opacity:1}}',
-    '.rtc-dialog__head{display:flex;align-items:center;gap:8px;margin-bottom:12px;}',
+    '.rtc-dialog__head{display:flex;align-items:center;gap:8px;margin-bottom:10px;}',
     '.rtc-dialog__title{flex:1 1 auto;margin:0;font-size:15.5px;font-weight:600;}',
+    '.rtc-dialog__sub{margin:0 0 10px;font-size:11px;color:var(--rtc-muted);}',
     '.rtc-dialog__body{min-height:0;overflow-y:auto;font-size:12.5px;color:var(--rtc-ink-2);}',
-    '.rtc-seg{display:flex;gap:2px;padding:2px;margin-bottom:10px;border-radius:999px;background:var(--rtc-soft);}',
-    '.rtc-seg__btn{flex:1 1 0;padding:6px 4px;border:0;border-radius:999px;background:transparent;',
-    'color:var(--rtc-muted);font:500 11.5px/1.3 var(--rtc-font);cursor:pointer;}',
-    '.rtc-seg__btn.is-active{background:var(--rtc-bg);color:var(--rtc-ink);box-shadow:0 1px 3px rgba(0,0,0,.08);}',
-    '.rtc-field{margin-bottom:10px;}',
-    '.rtc-field__label{display:flex;justify-content:space-between;gap:8px;margin-bottom:5px;font-size:11px;color:var(--rtc-muted);}',
-    '.rtc-textarea,.rtc-input{width:100%;padding:8px 10px;border:1px solid var(--rtc-line-strong);border-radius:10px;',
-    'background:var(--rtc-soft);color:var(--rtc-ink);font:400 13px/1.6 var(--rtc-font);outline:none;}',
-    '.rtc-textarea{min-height:76px;resize:none;}',
-    '.rtc-textarea:focus,.rtc-input:focus{border-color:var(--rtc-ink-2);}',
-    '.rtc-range{width:100%;accent-color:var(--rtc-ink);}',
-    '.rtc-calc__grid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;}',
-    '.rtc-cell{padding:8px 6px;border-radius:10px;background:var(--rtc-soft);text-align:center;}',
-    '.rtc-cell b{display:block;font-size:13.5px;font-weight:600;font-variant-numeric:tabular-nums;}',
-    '.rtc-cell span{font-size:9.5px;color:var(--rtc-muted);}',
-    '.rtc-price{margin:10px 0 0;font:10.5px/1.7 var(--rtc-font);color:var(--rtc-muted);white-space:pre-line;}',
+    '.rtc-field{margin-bottom:14px;}',
+    '.rtc-field__label{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:11px;color:var(--rtc-muted);}',
+    '.rtc-input{width:100%;padding:8px 10px;border:1px solid var(--rtc-line-strong);border-radius:10px;',
+    'background:var(--rtc-soft);color:var(--rtc-ink);font:400 13px/1.4 var(--rtc-font);outline:none;}',
+    '.rtc-input:focus{border-color:var(--rtc-ink-2);}',
+    '.rtc-daterow{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--rtc-muted);}',
+    '.rtc-daterow .rtc-input{flex:1 1 0;min-width:0;}',
     '.rtc-actions{display:flex;gap:8px;margin-top:14px;}',
     '.rtc-btn{flex:1 1 0;padding:9px 12px;border:1px solid var(--rtc-line-strong);border-radius:999px;background:transparent;',
     'color:var(--rtc-ink);font:500 12.5px/1 var(--rtc-font);cursor:pointer;}',
-    '.rtc-btn--primary{background:var(--rtc-accent);border-color:var(--rtc-accent);color:var(--rtc-on-accent);}'
+    '.rtc-btn--primary{background:var(--rtc-accent);border-color:var(--rtc-accent);color:var(--rtc-on-accent);}',
+    '.rtc-btn--danger{color:var(--rtc-warn);border-color:var(--rtc-warn);background:transparent;}'
   ].join('');
 
   function ensureStyle() {
@@ -676,10 +880,10 @@
   }
 
   function currentTheme() {
-    return theme === 'auto' ? detectTheme() : theme;
+    return settings.theme === 'light' || settings.theme === 'dark' ? settings.theme : detectTheme();
   }
 
-  /* ============================== 计算弹窗 ============================== */
+  /* ============================== 弹层基础 ============================== */
 
   var openDialogs = [];
 
@@ -690,11 +894,9 @@
     openDialogs = [];
   }
 
-  function openCalc() {
+  /** 通用弹层：title / subtitle / build(bodyEl, close) / actions */
+  function openDialog(opts) {
     ensureStyle();
-
-    var model = 'flash';
-    var ratio = 30;
 
     var overlay = el('div', { class: 'rtc-mask', 'data-theme': currentTheme() });
 
@@ -713,113 +915,32 @@
     });
     closeBtn.addEventListener('click', destroy);
 
-    var segWrap = el('div', { class: 'rtc-seg' });
-    [['flash', 'Flash'], ['pro', 'V4 Pro']].forEach(function (pair) {
+    var bodyEl = el('div', { class: 'rtc-dialog__body' });
+    if (typeof opts.build === 'function') opts.build(bodyEl, destroy);
+
+    var actions = (opts.actions || [{ label: '关闭', value: 'close', primary: true }]).map(function (item) {
       var btn = el('button', {
-        class: 'rtc-seg__btn' + (pair[0] === model ? ' is-active' : ''),
+        class: 'rtc-btn' + (item.primary ? ' rtc-btn--primary' : '') + (item.danger ? ' rtc-btn--danger' : ''),
         type: 'button',
-        text: pair[1],
-        'data-model': pair[0]
+        text: item.label
       });
       btn.addEventListener('click', function () {
-        model = pair[0];
-        Array.prototype.forEach.call(segWrap.children, function (node) {
-          node.classList.toggle('is-active', node.getAttribute('data-model') === model);
-        });
-        recalc();
+        if (typeof item.onClick === 'function') item.onClick(destroy);
+        else destroy();
       });
-      segWrap.appendChild(btn);
+      return btn;
     });
 
-    var textarea = el('textarea', {
-      class: 'rtc-textarea',
-      placeholder: '粘贴一段文字，估算输入 token',
-      spellcheck: 'false'
-    });
-    textarea.addEventListener('input', recalc);
-
-    var outInput = el('input', { class: 'rtc-input', type: 'number', min: '0', step: '50', value: '300' });
-    outInput.addEventListener('input', recalc);
-
-    var ratioLabel = el('span', { text: ratio + '%' });
-    var range = el('input', { class: 'rtc-range', type: 'range', min: '0', max: '100', step: '5', value: String(ratio) });
-    range.addEventListener('input', function () {
-      ratio = Number(range.value) || 0;
-      ratioLabel.textContent = ratio + '%';
-      recalc();
-    });
-
-    var cellIn = el('b', { text: '0' });
-    var cellHit = el('b', { text: '—' });
-    var cellOut = el('b', { text: '300' });
-    var cellCost = el('b', { text: '¥0' });
-
-    var priceEl = el('p', { class: 'rtc-price' });
-
-    function recalc() {
-      var text = textarea.value || '';
-      var inTokens = text ? estimateTokens(text) + 4 : 0;
-      var outTokens = Math.max(0, Math.round(Number(outInput.value) || 0));
-      var hit = Math.round(inTokens * ratio / 100);
-      var miss = inTokens - hit;
-      var p = PRICING[model];
-      var peak = isPeak(Date.now());
-      var band = peak ? 'peak' : 'off';
-      var cost = (hit * p.hit[band] + miss * p.miss[band] + outTokens * p.out[band]) / 1e6;
-
-      cellIn.textContent = fmtInt(inTokens);
-      cellHit.textContent = inTokens ? Math.round(ratio) + '%' : '—';
-      cellOut.textContent = fmtInt(outTokens);
-      cellCost.textContent = fmtMoney(cost);
-      priceEl.textContent =
-        '按 ' + p.name + ' · ' + bandLabel(peak) + '时段' +
-        '\n命中 ¥' + p.hit[band] + ' · 未命中 ¥' + p.miss[band] + ' · 输出 ¥' + p.out[band] + '（元/百万 tokens）' +
-        '\n命中 ' + fmtInt(hit) + ' · 未命中 ' + fmtInt(miss) + ' tokens · 官方价，高峰判定不含法定节假日';
-    }
-
-    var clearBtn = el('button', { class: 'rtc-btn', type: 'button', text: '清空' });
-    clearBtn.addEventListener('click', function () {
-      textarea.value = '';
-      recalc();
-      textarea.focus();
-    });
-    var doneBtn = el('button', { class: 'rtc-btn rtc-btn--primary', type: 'button', text: '关闭' });
-    doneBtn.addEventListener('click', destroy);
-
-    var dialog = el('div', { class: 'rtc-dialog' }, [
+    overlay.appendChild(el('div', { class: 'rtc-dialog' }, [
       el('div', { class: 'rtc-dialog__head' }, [
-        el('h2', { class: 'rtc-dialog__title', text: 'Token 计算' }),
+        el('h2', { class: 'rtc-dialog__title', text: opts.title || '' }),
         closeBtn
       ]),
-      el('div', { class: 'rtc-dialog__body' }, [
-        segWrap,
-        el('div', { class: 'rtc-field' }, [
-          el('div', { class: 'rtc-field__label' }, [el('span', { text: '输入文本' })]),
-          textarea
-        ]),
-        el('div', { class: 'rtc-field' }, [
-          el('div', { class: 'rtc-field__label' }, [el('span', { text: '输出 tokens' })]),
-          outInput
-        ]),
-        el('div', { class: 'rtc-field' }, [
-          el('div', { class: 'rtc-field__label' }, [
-            el('span', { text: '缓存命中比例' }),
-            ratioLabel
-          ]),
-          range
-        ]),
-        el('div', { class: 'rtc-calc__grid' }, [
-          el('div', { class: 'rtc-cell' }, [cellIn, el('span', { text: '输入 tokens' })]),
-          el('div', { class: 'rtc-cell' }, [cellHit, el('span', { text: '缓存命中' })]),
-          el('div', { class: 'rtc-cell' }, [cellOut, el('span', { text: '输出 tokens' })]),
-          el('div', { class: 'rtc-cell' }, [cellCost, el('span', { text: '预估费用' })])
-        ]),
-        priceEl
-      ]),
-      el('div', { class: 'rtc-actions' }, [clearBtn, doneBtn])
-    ]);
+      opts.subtitle ? el('p', { class: 'rtc-dialog__sub', text: opts.subtitle }) : null,
+      bodyEl,
+      el('div', { class: 'rtc-actions' }, actions)
+    ]));
 
-    overlay.appendChild(dialog);
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) destroy();
     });
@@ -827,43 +948,36 @@
     document.body.appendChild(overlay);
     document.addEventListener('keydown', onKey);
     openDialogs.push(destroy);
-
-    recalc();
+    return destroy;
   }
 
-  /* ============================== App 页面 ============================== */
+  /* ============================== 共用渲染 ============================== */
 
-  async function hydrate() {
-    if (!store) return;
-    var saved = null;
-    try { saved = await store.get(LOG_KEY); } catch (e) { saved = null; }
-    var savedLogs = Array.isArray(saved) ? saved : [];
-    var seen = {};
-    var merged = [];
-    savedLogs.concat(logs).forEach(function (rec) {
-      if (!rec || !rec.id || seen[rec.id]) return;
-      seen[rec.id] = true;
-      rec.cost = computeCost(rec);
-      merged.push(rec);
-    });
-    merged.sort(function (a, b) { return (b.at || 0) - (a.at || 0); });
-    logs = merged.slice(0, MAX_LOGS);
+  function kindText(rec) {
+    if (!rec.ok) return '失败';
+    return KIND_LABEL[rec.kind] || 'AI';
   }
 
-  async function loadTheme() {
-    if (!store) { theme = 'auto'; return; }
-    try {
-      var saved = await store.get(THEME_KEY);
-      theme = saved === 'dark' || saved === 'light' ? saved : 'auto';
-    } catch (e) {
-      theme = 'auto';
-    }
+  function costText(rec) {
+    return rec.cost === null || rec.cost === undefined ? '—' : fmtMoney(rec.cost);
+  }
+
+  function summaryChildren(stat) {
+    var ratio = stat.prompt ? Math.round(stat.hit / stat.prompt * 100) + '%' : '—';
+    var cost = stat.priced ? fmtMoney(stat.cost) : '—';
+    return [
+      el('div', { class: 'rtc-tile' }, [el('b', { text: fmtInt(stat.calls) }), el('span', { text: '调用' })]),
+      el('div', { class: 'rtc-tile' }, [el('b', { text: fmtInt(stat.prompt + stat.out) }), el('span', { text: 'Token' })]),
+      el('div', { class: 'rtc-tile' }, [el('b', { text: ratio }), el('span', { text: '缓存命中' })]),
+      el('div', { class: 'rtc-tile' }, [el('b', { text: cost }), el('span', { text: '预估费用' })])
+    ];
   }
 
   function detailText(rec) {
     var lines = [];
     lines.push(rec.method + ' ' + rec.url);
-    lines.push('状态 ' + (rec.status || '—') + ' · 耗时 ' + fmtMs(rec.elapsedMs) + ' · ' + (rec.stream ? '流式' : '非流式') + ' · 模型 ' + (rec.model || '未知'));
+    lines.push('状态 ' + (rec.status || '—') + ' · 耗时 ' + fmtMs(rec.elapsedMs) + ' · ' +
+      (rec.stream ? '流式' : '非流式') + ' · 模型 ' + (rec.model || '未知'));
     if (rec.kind === 'image' || rec.kind === 'tts' || rec.kind === 'embed') {
       lines.push('生图 / 语音 / 向量接口不按 token 计价，只记录调用');
     } else if (!rec.ok) {
@@ -871,12 +985,13 @@
     } else if (rec.deepseek) {
       var p = PRICING[rec.cls] || PRICING.flash;
       var band = rec.peak ? 'peak' : 'off';
-      lines.push('单价（' + p.name + ' · ' + bandLabel(rec.peak) + '）命中 ¥' + p.hit[band] + ' / 未命中 ¥' + p.miss[band] + ' / 输出 ¥' + p.out[band] + ' 每百万 tokens');
+      lines.push('单价（' + p.name + ' · ' + bandLabel(rec.peak) + '）命中 ¥' + p.hit[band] +
+        ' / 未命中 ¥' + p.miss[band] + ' / 输出 ¥' + p.out[band] + ' 每百万 tokens');
       lines.push('命中 ' + fmtInt(rec.hit) + ' · 未命中 ' + fmtInt(rec.miss) + ' · 输出 ' + fmtInt(rec.out) +
         (rec.estimated ? '（估算）' : '（接口返回）') + ' · 费用 ' + fmtMoney(rec.cost));
     } else {
-      lines.push('该服务不在 DeepSeek 价格表内，只统计 token：输入 ' + fmtInt(rec.prompt) + ' · 输出 ' + fmtInt(rec.out) +
-        (rec.estimated ? '（估算）' : ''));
+      lines.push('该服务不在 DeepSeek 价格表内，只统计 token：输入 ' + fmtInt(rec.prompt) +
+        ' · 输出 ' + fmtInt(rec.out) + (rec.estimated ? '（估算）' : ''));
     }
     if (rec.messages) lines.push('上下文 ' + rec.messages + ' 条消息');
     if (rec.error) lines.push('错误：' + rec.error);
@@ -887,43 +1002,252 @@
     return lines.join('\n');
   }
 
+  function fullRow(rec) {
+    var row = el('div', { class: 'rtc-row' }, [
+      el('div', { class: 'rtc-row__head' }, [
+        el('span', { class: 'rtc-row__time', text: fmtClock(rec.at) }),
+        el('span', { class: 'rtc-row__badge' + (rec.ok ? '' : ' is-fail'), text: kindText(rec) }),
+        el('span', { class: 'rtc-row__model', text: rec.model || rec.host || '未知模型' }),
+        el('span', { class: 'rtc-row__cost', text: costText(rec) })
+      ]),
+      el('div', { class: 'rtc-row__meta' }, [
+        el('span', { text: rec.host || '未知服务' }),
+        el('span', { text: '输入 ' + fmtInt(rec.prompt) + (num(rec.hit) ? ' · 缓存 ' + fmtInt(rec.hit) : '') }),
+        el('span', { text: '输出 ' + fmtInt(rec.out) }),
+        el('span', { text: fmtMs(rec.elapsedMs) })
+      ]),
+      el('div', { class: 'rtc-row__meta rtc-row__meta--dim' }, [
+        el('span', { text: '来源 ' + callerText(rec) }),
+        rec.estimated ? el('span', { text: '≈ 估算' }) : null,
+        rec.stream ? el('span', { text: '流式' }) : null,
+        el('span', { class: 'rtc-row__more', text: '详情' })
+      ]),
+      el('div', { class: 'rtc-row__detail', text: detailText(rec) })
+    ]);
+    row.addEventListener('click', function () {
+      row.classList.toggle('is-open');
+    });
+    return row;
+  }
+
+  function miniRow(rec) {
+    return el('div', { class: 'rtc-row rtc-row--mini' }, [
+      el('div', { class: 'rtc-row__head' }, [
+        el('span', { class: 'rtc-row__time', text: fmtClock(rec.at) }),
+        el('span', { class: 'rtc-row__badge' + (rec.ok ? '' : ' is-fail'), text: kindText(rec) }),
+        el('span', { class: 'rtc-row__model', text: rec.model || rec.host || '未知模型' }),
+        el('span', { class: 'rtc-row__cost', text: costText(rec) })
+      ]),
+      el('div', { class: 'rtc-row__meta' }, [
+        el('span', { text: '入 ' + fmtInt(rec.prompt) + (num(rec.hit) ? '（缓存 ' + fmtInt(rec.hit) + '）' : '') }),
+        el('span', { text: '出 ' + fmtInt(rec.out) }),
+        el('span', { text: rec.host || '' }),
+        el('span', { text: fmtMs(rec.elapsedMs) })
+      ])
+    ]);
+  }
+
+  /* ============================== 「+」面板账单 ============================== */
+
+  async function openBill(roche) {
+    await hydrateReadOnly(roche);
+
+    var now = Date.now();
+    var range = { from: dayStart(now), to: dayEnd(now), label: '今天' };
+    var stat = statsIn(range.from, range.to);
+    var list = recordsIn(range.from, range.to);
+    var cleared = purgedCallsIn(range.from, range.to);
+
+    openDialog({
+      title: 'Token 账单',
+      subtitle: '今天 · ' + fmtInt(stat.calls) + ' 次调用 · ' + fmtInt(stat.prompt + stat.out) + ' tokens',
+      build: function (body) {
+        body.appendChild(el('div', { class: 'rtc-summary' }, summaryChildren(stat)));
+
+        if (!list.length) {
+          body.appendChild(el('div', { class: 'rtc-empty' }, [
+            el('div', { text: '今天还没有 AI 调用' }),
+            el('div', { text: '正常聊天几句，这里就会出现记录' })
+          ]));
+          if (cleared) {
+            body.appendChild(el('p', {
+              class: 'rtc-footmargin',
+              text: '已清除 ' + fmtInt(cleared) + ' 次调用的明细，统计仍包含它们'
+            }));
+          }
+          return;
+        }
+
+        var wrap = el('div', { class: 'rtc-list' });
+        list.slice(0, 6).forEach(function (rec) { wrap.appendChild(miniRow(rec)); });
+        body.appendChild(wrap);
+
+        if (list.length > 6) {
+          body.appendChild(el('p', {
+            class: 'rtc-footmargin',
+            text: '还有 ' + (list.length - 6) + ' 条，进 App 看完整账单'
+          }));
+        } else if (cleared) {
+          body.appendChild(el('p', {
+            class: 'rtc-footmargin',
+            text: '已清除 ' + fmtInt(cleared) + ' 次调用的明细，统计仍包含它们'
+          }));
+        }
+      },
+      actions: [
+        {
+          label: '完整账单',
+          onClick: function (destroy) {
+            destroy();
+            try {
+              if (roche && roche.ui && typeof roche.ui.openApp === 'function') roche.ui.openApp('token-console-home');
+            } catch (e) { /* ignore */ }
+          }
+        },
+        { label: '关闭', primary: true }
+      ]
+    });
+  }
+
+  /* ============================== 设置 ============================== */
+
+  function openSettings(roche, onChange) {
+    var draft = normalizeSettings(settings);
+
+    function apply(patch) {
+      Object.keys(patch).forEach(function (k) { draft[k] = patch[k]; });
+      settings = normalizeSettings(draft);
+      if (store) scheduleSave();
+      if (typeof onChange === 'function') onChange();
+      refresh();
+    }
+
+    var rangeChips = el('div', { class: 'rtc-chips' });
+    var dateRow = el('div', { class: 'rtc-daterow' });
+    var clearBtn = el('button', { class: 'rtc-btn rtc-btn--danger', type: 'button' });
+    var themeChips = el('div', { class: 'rtc-chips' });
+
+    var startInput = el('input', { class: 'rtc-input', type: 'date' });
+    var endInput = el('input', { class: 'rtc-input', type: 'date' });
+    startInput.value = draft.start || dayKey(Date.now());
+    endInput.value = draft.end || dayKey(Date.now());
+
+    function refresh() {
+      Array.prototype.forEach.call(rangeChips.children, function (node) {
+        node.classList.toggle('is-active', node.getAttribute('data-range') === settings.range);
+      });
+      Array.prototype.forEach.call(themeChips.children, function (node) {
+        node.classList.toggle('is-active', node.getAttribute('data-theme-value') === settings.theme);
+      });
+      dateRow.style.display = settings.range === 'custom' ? 'flex' : 'none';
+      var range = resolveRange(settings, Date.now());
+      clearBtn.textContent = '清除「' + range.label + '」的明细';
+    }
+
+    RANGES.forEach(function (item) {
+      var btn = el('button', {
+        class: 'rtc-chip' + (draft.range === item.id ? ' is-active' : ''),
+        type: 'button',
+        text: item.label,
+        'data-range': item.id
+      });
+      btn.addEventListener('click', function () { apply({ range: item.id }); });
+      rangeChips.appendChild(btn);
+    });
+
+    startInput.addEventListener('change', function () {
+      apply({ start: startInput.value, range: 'custom' });
+    });
+    endInput.addEventListener('change', function () {
+      apply({ end: endInput.value, range: 'custom' });
+    });
+
+    dateRow.appendChild(startInput);
+    dateRow.appendChild(el('span', { text: '至' }));
+    dateRow.appendChild(endInput);
+
+    [['auto', '跟随宿主'], ['light', '日间'], ['dark', '夜间']].forEach(function (pair) {
+      var btn = el('button', {
+        class: 'rtc-chip' + (draft.theme === pair[0] ? ' is-active' : ''),
+        type: 'button',
+        text: pair[1],
+        'data-theme-value': pair[0]
+      });
+      btn.addEventListener('click', function () { apply({ theme: pair[0] }); });
+      themeChips.appendChild(btn);
+    });
+
+    clearBtn.addEventListener('click', async function () {
+      var range = resolveRange(settings, Date.now());
+      var ok = true;
+      if (roche && roche.ui && typeof roche.ui.confirm === 'function') {
+        ok = await roche.ui.confirm({
+          title: '清除明细',
+          message: '清除「' + range.label + '」的明细记录？调用次数和 token 数会保留在统计里。'
+        });
+      }
+      if (!ok) return;
+      var removed = purgeRange(range.from, range.to);
+      if (typeof onChange === 'function') onChange();
+      if (roche && roche.ui && roche.ui.toast) {
+        roche.ui.toast(removed ? '已清除 ' + removed + ' 条明细' : '这段范围没有明细可清');
+      }
+    });
+
+    openDialog({
+      title: '设置',
+      build: function (body) {
+        body.appendChild(el('div', { class: 'rtc-field' }, [
+          el('div', { class: 'rtc-field__label' }, [
+            el('span', { text: '查看范围' }),
+            el('span', { text: '默认今天' })
+          ]),
+          rangeChips,
+          dateRow
+        ]));
+
+        body.appendChild(el('div', { class: 'rtc-field' }, [
+          el('div', { class: 'rtc-field__label' }, [el('span', { text: '主题' })]),
+          themeChips
+        ]));
+
+        body.appendChild(el('div', { class: 'rtc-field' }, [
+          el('div', { class: 'rtc-field__label' }, [el('span', { text: '清除日志' })]),
+          clearBtn,
+          el('p', {
+            class: 'rtc-note',
+            text: '只删除明细行，调用次数与 token 数会保留在统计里。'
+          })
+        ]));
+      },
+      actions: [{ label: '完成', primary: true }]
+    });
+
+    refresh();
+  }
+
+  /* ============================== App 页面 ============================== */
+
   async function createView(container, roche) {
-    store = roche && roche.storage ? roche.storage : store;
-    await loadTheme();
-    await hydrate();
+    await hydrateApp(roche);
 
     var filter = 'all';
+
     var root = el('div', { class: 'rtc-root', 'data-theme': currentTheme() });
-    container.setAttribute('data-theme', currentTheme());
-
     var subEl = el('p', { class: 'rtc-sub' });
+    var summaryEl = el('div', { class: 'rtc-summary' });
+    var listEl = el('div', { class: 'rtc-list' });
+    var footerEl = el('p', { class: 'rtc-footmargin' });
 
-    var themeBtn = el('button', {
-      class: 'rtc-iconbtn', type: 'button',
-      title: currentTheme() === 'dark' ? '切到日间' : '切到夜间',
-      'aria-label': '切换日夜',
-      html: currentTheme() === 'dark' ? ICONS.sun : ICONS.moon
+    var settingsBtn = el('button', {
+      class: 'rtc-iconbtn', type: 'button', title: '设置', 'aria-label': '设置', html: ICONS.settings
     });
-
-    var clearBtn = el('button', {
-      class: 'rtc-iconbtn', type: 'button', title: '清空记录', 'aria-label': '清空记录', html: ICONS.trash
-    });
-
     var closeBtn = el('button', {
       class: 'rtc-iconbtn rtc-iconbtn--close', type: 'button', title: '关闭', 'aria-label': '关闭', html: ICONS.close
     });
 
-    var tiles = {
-      calls: el('b', { text: '0' }),
-      tokens: el('b', { text: '0' }),
-      ratio: el('b', { text: '—' }),
-      cost: el('b', { text: '—' })
-    };
-
-    var listEl = el('div', { class: 'rtc-list' });
-    var chipsEl = el('div', { class: 'rtc-chips' });
-
     var FILTERS = [['all', '全部'], ['hit', '命中缓存'], ['fail', '失败']];
+    var chipsEl = el('div', { class: 'rtc-chips' });
     var chipNodes = FILTERS.map(function (pair) {
       var btn = el('button', {
         class: 'rtc-chip' + (pair[0] === filter ? ' is-active' : ''),
@@ -942,10 +1266,25 @@
       return btn;
     });
 
-    var calcLink = el('button', { class: 'rtc-link', type: 'button', text: '试算' });
-    calcLink.addEventListener('click', function () { openCalc(); });
+    var rangeBtn = el('button', { class: 'rtc-rangebtn', type: 'button', text: '今天' });
+    rangeBtn.addEventListener('click', function () { openSettings(roche, render); });
 
     var priceBar = el('p', { class: 'rtc-pricebar' });
+
+    function applyTheme() {
+      var t = currentTheme();
+      root.setAttribute('data-theme', t);
+      container.setAttribute('data-theme', t);
+    }
+
+    function renderSummary(range) {
+      var stat = statsIn(range.from, range.to);
+      summaryEl.replaceChildren();
+      summaryChildren(stat).forEach(function (node) { summaryEl.appendChild(node); });
+      subEl.textContent = range.label + ' · ' + fmtInt(stat.calls) + ' 次调用 · ' +
+        fmtInt(stat.prompt + stat.out) + ' tokens';
+      return stat;
+    }
 
     function renderPriceBar() {
       var peak = isPeak(Date.now());
@@ -957,139 +1296,63 @@
         'V4 Pro 命中 ¥' + p.hit[band] + ' · 未命中 ¥' + p.miss[band] + ' · 输出 ¥' + p.out[band];
     }
 
-    function setTheme(next) {
-      theme = next === 'dark' ? 'dark' : 'light';
-      root.setAttribute('data-theme', theme);
-      container.setAttribute('data-theme', theme);
-      themeBtn.innerHTML = theme === 'dark' ? ICONS.sun : ICONS.moon;
-      themeBtn.setAttribute('title', theme === 'dark' ? '切到日间' : '切到夜间');
-      if (store) {
-        try { Promise.resolve(store.set(THEME_KEY, theme)).catch(function () {}); } catch (e) { /* ignore */ }
-      }
-    }
-
-    themeBtn.addEventListener('click', function () {
-      setTheme(currentTheme() === 'dark' ? 'light' : 'dark');
-    });
-
-    clearBtn.addEventListener('click', async function () {
-      var ok = true;
-      if (roche && roche.ui && typeof roche.ui.confirm === 'function') {
-        ok = await roche.ui.confirm({ title: '清空记录', message: '清空本地保存的调用记录？聊天内容不会被删除。' });
-      }
-      if (!ok) return;
-      logs = [];
-      if (store) {
-        try { await store.set(LOG_KEY, []); } catch (e) { /* ignore */ }
-      }
-      renderSummary();
-      renderList();
-      if (roche && roche.ui && roche.ui.toast) roche.ui.toast('调用记录已清空');
-    });
-
-    closeBtn.addEventListener('click', function () {
-      if (roche && roche.ui && typeof roche.ui.closeApp === 'function') roche.ui.closeApp();
-    });
-
-    function filtered() {
-      return logs.filter(function (rec) {
+    function filterRecords(list) {
+      return list.filter(function (rec) {
         if (filter === 'hit') return num(rec.hit) > 0;
         if (filter === 'fail') return !rec.ok;
         return true;
       });
     }
 
-    function renderSummary() {
-      var prompt = 0;
-      var hit = 0;
-      var out = 0;
-      var cost = 0;
-      var costKnown = false;
-      logs.forEach(function (rec) {
-        prompt += num(rec.prompt);
-        hit += num(rec.hit);
-        out += num(rec.out);
-        if (rec.cost !== null && rec.cost !== undefined) {
-          cost += rec.cost;
-          costKnown = true;
-        }
-      });
-      tiles.calls.textContent = fmtInt(logs.length);
-      tiles.tokens.textContent = fmtInt(prompt + out);
-      tiles.ratio.textContent = prompt ? Math.round(hit / prompt * 100) + '%' : '—';
-      tiles.cost.textContent = costKnown ? fmtMoney(cost) : '—';
-      subEl.textContent = logs.length
-        ? '监听中 · 已记录 ' + logs.length + ' 次调用'
-        : '监听中 · 还没有调用记录';
-    }
-
-    function rowNode(rec) {
-      var row = el('div', { class: 'rtc-row' }, [
-        el('div', { class: 'rtc-row__head' }, [
-          el('span', { class: 'rtc-row__time', text: fmtClock(rec.at) }),
-          el('span', {
-            class: 'rtc-row__badge' + (rec.ok ? '' : ' is-fail'),
-            text: rec.ok ? (KIND_LABEL[rec.kind] || 'AI') : '失败'
-          }),
-          el('span', { class: 'rtc-row__model', text: rec.model || rec.host || '未知模型' }),
-          el('span', { class: 'rtc-row__cost', text: rec.cost === null || rec.cost === undefined ? '—' : fmtMoney(rec.cost) })
-        ]),
-        el('div', { class: 'rtc-row__meta' }, [
-          el('span', { text: rec.host || '未知服务' }),
-          el('span', { text: '输入 ' + fmtInt(rec.prompt) + (num(rec.hit) ? ' · 缓存 ' + fmtInt(rec.hit) : '') }),
-          el('span', { text: '输出 ' + fmtInt(rec.out) }),
-          el('span', { text: fmtMs(rec.elapsedMs) })
-        ]),
-        el('div', { class: 'rtc-row__meta rtc-row__meta--dim' }, [
-          el('span', { text: '来源 ' + callerText(rec) }),
-          rec.estimated ? el('span', { text: '≈ 估算' }) : null,
-          rec.stream ? el('span', { text: '流式' }) : null,
-          el('span', { class: 'rtc-row__more', text: '详情' })
-        ]),
-        el('div', { class: 'rtc-row__detail', text: detailText(rec) })
-      ]);
-      row.addEventListener('click', function () {
-        row.classList.toggle('is-open');
-      });
-      return row;
-    }
-
     function renderList() {
+      var range = resolveRange(settings, Date.now());
+      var list = filterRecords(recordsIn(range.from, range.to));
+      var cleared = purgedCallsIn(range.from, range.to);
+
       listEl.replaceChildren();
-      var list = filtered();
       if (!list.length) {
         listEl.appendChild(el('div', { class: 'rtc-empty' }, [
-          el('div', { text: logs.length ? '没有符合条件的记录' : '还没有捕获到 AI 请求' }),
+          el('div', { text: recordsIn(range.from, range.to).length ? '没有符合条件的记录' : range.label + '还没有调用记录' }),
           el('div', {
-            text: logs.length
+            text: recordsIn(range.from, range.to).length
               ? '换个筛选条件试试'
               : '正常聊天、生图或插件调用 AI 后，这里会自动出现记录'
           })
         ]));
-        return;
+      } else {
+        list.forEach(function (rec) { listEl.appendChild(fullRow(rec)); });
       }
-      list.forEach(function (rec) {
-        listEl.appendChild(rowNode(rec));
-      });
+
+      if (cleared) {
+        footerEl.textContent = '已清除 ' + fmtInt(cleared) + ' 次调用的明细，统计仍包含它们';
+        footerEl.style.display = 'block';
+      } else {
+        footerEl.style.display = 'none';
+      }
+    }
+
+    function render() {
+      applyTheme();
+      var range = resolveRange(settings, Date.now());
+      renderSummary(range);
+      rangeBtn.textContent = range.label;
+      renderList();
+      renderPriceBar();
     }
 
     root.appendChild(el('header', { class: 'rtc-header' }, [
       el('div', { class: 'rtc-header__text' }, [
-        el('h1', { class: 'rtc-title', text: 'Token 控制台' }),
+        el('h1', { class: 'rtc-title', text: 'Token 账单' }),
         subEl
       ]),
-      el('div', { class: 'rtc-header__actions' }, [themeBtn, clearBtn, closeBtn])
+      el('div', { class: 'rtc-header__actions' }, [settingsBtn, closeBtn])
     ]));
 
     root.appendChild(el('div', { class: 'rtc-body' }, [
-      el('div', { class: 'rtc-summary' }, [
-        el('div', { class: 'rtc-tile' }, [tiles.calls, el('span', { text: '调用' })]),
-        el('div', { class: 'rtc-tile' }, [tiles.tokens, el('span', { text: 'Token' })]),
-        el('div', { class: 'rtc-tile' }, [tiles.ratio, el('span', { text: '缓存命中' })]),
-        el('div', { class: 'rtc-tile' }, [tiles.cost, el('span', { text: '预估费用' })])
-      ]),
-      el('div', { class: 'rtc-toolbar' }, [chipsEl, calcLink]),
+      summaryEl,
+      el('div', { class: 'rtc-toolbar' }, [chipsEl, rangeBtn]),
       listEl,
+      footerEl,
       priceBar,
       el('p', {
         class: 'rtc-note',
@@ -1099,15 +1362,13 @@
 
     container.appendChild(root);
 
-    var off = subscribe(function () {
-      renderSummary();
-      renderList();
-      renderPriceBar();
+    settingsBtn.addEventListener('click', function () { openSettings(roche, render); });
+    closeBtn.addEventListener('click', function () {
+      if (roche && roche.ui && typeof roche.ui.closeApp === 'function') roche.ui.closeApp();
     });
 
-    renderSummary();
-    renderList();
-    renderPriceBar();
+    var off = subscribe(render);
+    render();
 
     return {
       destroy: function () {
@@ -1116,7 +1377,7 @@
           clearTimeout(saveTimer);
           saveTimer = 0;
         }
-        saveLogs();
+        flushSave();
       }
     };
   }
@@ -1146,11 +1407,11 @@
     id: 'token-console',
     name: 'Token 控制台',
     version: VERSION,
-    description: '观察 AI 请求：模型、输入/输出 token、DeepSeek 缓存命中、预估费用与调用位置。',
+    description: 'Token 账单：模型、输入/输出 token、DeepSeek 缓存命中、预估费用与调用位置。',
     apps: [
       {
         id: 'token-console-home',
-        name: 'Token 控制台',
+        name: 'Token 账单',
         icon: 'chart',
         iconImage: '',
         mount: mount,
@@ -1160,11 +1421,11 @@
     chat: {
       plusActions: [
         {
-          id: 'token-calc',
-          label: 'Token 计算',
-          iconSvg: ICONS.calc,
-          open: function () {
-            openCalc();
+          id: 'token-bill',
+          label: 'Token 账单',
+          iconSvg: ICONS.bill,
+          open: function (ctx, roche) {
+            openBill(roche || (ctx && ctx.roche));
           }
         }
       ]
