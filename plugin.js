@@ -1,5 +1,5 @@
 /*!
- * token-console v1.2.0 — Roche 插件
+ * token-console v1.3.0 — Roche 插件
  * Token 账单：观察页面发往 AI 服务的请求（模型、输入/输出 token、DeepSeek 缓存命中、预估费用、调用位置）。
  * 只记录请求元信息（地址、模型、token 数、调用栈文件名/行号），不保存对话正文，不保存 API Key。
  * 价格：DeepSeek 官方公布价（元 / 百万 tokens），按北京时间高峰 / 空闲自动切换。
@@ -7,7 +7,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.2.0';
+  var VERSION = '1.3.0';
   var STYLE_ID = 'rtc-style';
   var LOG_KEY = 'logs';
   var PURGED_KEY = 'purged';
@@ -175,6 +175,18 @@
   };
 
   var KIND_LABEL = { chat: '聊天', image: '生图', tts: '语音', embed: '向量' };
+
+  var KIND_FILTERS = [['all', '全部'], ['chat', '聊天'], ['image', '生图'], ['tts', '语音'], ['embed', '向量']];
+
+  /** 状态 + 类型双重筛选 */
+  function applyFilters(list, statusFilter, kindFilter) {
+    return list.filter(function (rec) {
+      if (statusFilter === 'hit' && num(rec.hit) <= 0) return false;
+      if (statusFilter === 'fail' && rec.ok) return false;
+      if (kindFilter !== 'all' && rec.kind !== kindFilter) return false;
+      return true;
+    });
+  }
 
   /* ============================== 状态 ============================== */
 
@@ -453,6 +465,13 @@
     return AI_PATHS.some(function (re) { return re.test(path); });
   }
 
+  /** Gemini 风格请求的 model 在 URL 路径里：/v1beta/models/gemini-xxx:generateContent */
+  function modelFromPath(path) {
+    var m = String(path || '').match(/models\/([^:\/?#]+)/);
+    if (!m) return '';
+    try { return decodeURIComponent(m[1]).slice(0, 60); } catch (e) { return m[1].slice(0, 60); }
+  }
+
   function kindOf(path) {
     var p = String(path || '').toLowerCase();
     if (/image/.test(p)) return 'image';
@@ -530,7 +549,7 @@
       var json = null;
       try { json = JSON.parse(s); } catch (e) { json = null; }
       if (json) {
-        out.usage = json.usage || (json.response && json.response.usage) || null;
+        out.usage = json.usage || json.usageMetadata || (json.response && json.response.usage) || null;
         if (typeof json.model === 'string') out.model = json.model;
         var choice = json.choices && json.choices[0];
         if (choice) out.text = textOfContent(choice.message ? choice.message.content : choice.text);
@@ -562,6 +581,7 @@
       if (!obj) continue;
       if (typeof obj.model === 'string' && !out.model) out.model = obj.model;
       if (obj.usage) out.usage = obj.usage;
+      if (obj.usageMetadata) out.usage = obj.usageMetadata;
       if (obj.response && obj.response.usage) out.usage = obj.response.usage;
       var ch = obj.choices && obj.choices[0];
       if (ch) {
@@ -583,6 +603,12 @@
     var cachedWrite = num(usage.cache_creation_input_tokens);
     var hit = num(usage.prompt_cache_hit_tokens) || cachedRead;
     if (!hit && usage.prompt_tokens_details) hit = num(usage.prompt_tokens_details.cached_tokens);
+    // Gemini 原生格式：promptTokenCount（已含缓存），candidatesTokenCount，cachedContentTokenCount
+    if (!prompt && usage.promptTokenCount !== undefined) {
+      prompt = num(usage.promptTokenCount);
+      outTok = outTok || num(usage.candidatesTokenCount);
+      hit = hit || num(usage.cachedContentTokenCount);
+    }
     var miss = num(usage.prompt_cache_miss_tokens);
     if (cachedRead || cachedWrite) prompt = prompt + cachedRead + cachedWrite;
     if (!prompt) prompt = hit + miss;
@@ -646,7 +672,8 @@
   var hooked = false;
 
   function applyParsed(rec, parsed, usage) {
-    if (parsed.model) rec.model = rec.model || parsed.model;
+    // 响应里的 model 是服务商实际服务的型号，比请求体里的更可信（中转站常改名）
+    if (parsed.model) rec.model = parsed.model;
     rec.deepseek = isDeepseek(rec.host, rec.model);
     rec.cls = clsOf(rec.model);
     var u = usage;
@@ -713,7 +740,8 @@
     Promise.resolve(bodyPromise).then(function (body) {
       var bodyText = String(body || '');
       rec.stream = /"stream"\s*:\s*true/.test(bodyText);
-      rec.model = modelOf(bodyText);
+      rec.model = modelOf(bodyText) || modelFromPath(rec.path);
+      rec.reqModel = rec.model;
       rec.deepseek = isDeepseek(rec.host, rec.model);
       rec.cls = clsOf(rec.model);
       var promptInfo = promptTokensFromBody(bodyText);
@@ -901,6 +929,7 @@
     '.rtc-tile b{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;}',
     '.rtc-tile span{font-size:9.5px;color:var(--rtc-muted);}',
     '.rtc-toolbar{display:flex;align-items:center;gap:8px;margin:14px 0 2px;}',
+    '.rtc-toolbar--kinds{margin:6px 0 2px;}',
     '.rtc-chips{display:flex;flex:1 1 auto;flex-wrap:wrap;gap:6px;}',
     '.rtc-chip{padding:5px 10px;border:1px solid var(--rtc-line);border-radius:999px;background:transparent;',
     'color:var(--rtc-muted);font:500 11.5px/1 var(--rtc-font);cursor:pointer;}',
@@ -1106,6 +1135,9 @@
         ' · 输出 ' + fmtInt(rec.out) + (rec.estimated ? '（估算）' : ''));
     }
     if (rec.messages) lines.push('上下文 ' + rec.messages + ' 条消息');
+    if (rec.reqModel && rec.model && rec.reqModel !== rec.model) {
+      lines.push('请求模型 ' + rec.reqModel + ' → 服务商实际 ' + rec.model);
+    }
     if (rec.error) lines.push('错误：' + rec.error);
     (rec.frames || []).slice(0, 3).forEach(function (f, i) {
       lines.push('调用位置 ' + (i + 1) + '：' + f.file + ':' + f.line);
@@ -1170,52 +1202,70 @@
     var list = recordsIn(range.from, range.to);
     var cleared = purgedCallsIn(range.from, range.to);
 
+    var statusFilter = 'all';
+    var kindFilter = 'all';
+
     openDialog({
       title: 'Token 账单',
       subtitle: '今天 · ' + fmtInt(stat.calls) + ' 次调用 · ' + fmtInt(stat.prompt + stat.out) + ' tokens',
       build: function (body) {
         body.appendChild(el('div', { class: 'rtc-summary' }, summaryChildren(stat)));
 
-        if (!list.length) {
-          body.appendChild(el('div', { class: 'rtc-empty' }, [
-            el('div', { text: '今天还没有 AI 调用' }),
-            el('div', { text: '正常聊天几句，这里就会出现记录' })
-          ]));
-          if (cleared) {
-            body.appendChild(el('p', {
-              class: 'rtc-footmargin',
-              text: '已清除 ' + fmtInt(cleared) + ' 次调用的明细，统计仍包含它们'
-            }));
+        var listWrap = el('div', { class: 'rtc-list' });
+        var footEl = el('p', { class: 'rtc-footmargin' });
+
+        function renderList() {
+          listWrap.replaceChildren();
+          var filtered = applyFilters(list, statusFilter, kindFilter);
+
+          if (!filtered.length) {
+            listWrap.appendChild(el('div', { class: 'rtc-empty' }, [
+              el('div', { text: list.length ? '没有符合条件的记录' : '今天还没有 AI 调用' }),
+              el('div', { text: list.length ? '换个筛选条件试试' : '正常聊天几句，这里就会出现记录' })
+            ]));
+          } else {
+            filtered.slice(0, 12).forEach(function (rec) { listWrap.appendChild(miniRow(rec)); });
           }
-          return;
+
+          var hidden = filtered.length - Math.min(filtered.length, 12);
+          var notes = [];
+          if (hidden > 0) notes.push('还有 ' + hidden + ' 条更早的记录');
+          if (cleared) notes.push('已清除 ' + fmtInt(cleared) + ' 次调用的明细，统计仍包含');
+          footEl.textContent = notes.join(' · ');
+          footEl.style.display = notes.length ? 'block' : 'none';
         }
 
-        var wrap = el('div', { class: 'rtc-list' });
-        list.slice(0, 6).forEach(function (rec) { wrap.appendChild(miniRow(rec)); });
-        body.appendChild(wrap);
-
-        if (list.length > 6) {
-          body.appendChild(el('p', {
-            class: 'rtc-footmargin',
-            text: '还有 ' + (list.length - 6) + ' 条，进 App 看完整账单'
-          }));
-        } else if (cleared) {
-          body.appendChild(el('p', {
-            class: 'rtc-footmargin',
-            text: '已清除 ' + fmtInt(cleared) + ' 次调用的明细，统计仍包含它们'
-          }));
+        function chipRow(label, options, get, set) {
+          var wrap = el('div', { class: 'rtc-field' });
+          wrap.appendChild(el('div', { class: 'rtc-field__label' }, [el('span', { text: label })]));
+          var chips = el('div', { class: 'rtc-chips' });
+          options.forEach(function (pair) {
+            var btn = el('button', {
+              class: 'rtc-chip' + (get() === pair[0] ? ' is-active' : ''),
+              type: 'button',
+              text: pair[1],
+              'data-chip': pair[0]
+            });
+            btn.addEventListener('click', function () {
+              set(pair[0]);
+              Array.prototype.forEach.call(chips.children, function (node) {
+                node.classList.toggle('is-active', node.getAttribute('data-chip') === pair[0]);
+              });
+              renderList();
+            });
+            chips.appendChild(btn);
+          });
+          wrap.appendChild(chips);
+          return wrap;
         }
+
+        body.appendChild(chipRow('类型', KIND_FILTERS, function () { return kindFilter; }, function (v) { kindFilter = v; }));
+        body.appendChild(chipRow('状态', [['all', '全部'], ['hit', '命中缓存'], ['fail', '失败']], function () { return statusFilter; }, function (v) { statusFilter = v; }));
+        body.appendChild(listWrap);
+        body.appendChild(footEl);
+        renderList();
       },
       actions: [
-        {
-          label: '完整账单',
-          onClick: function (destroy) {
-            destroy();
-            try {
-              if (roche && roche.ui && typeof roche.ui.openApp === 'function') roche.ui.openApp('token-console-home');
-            } catch (e) { /* ignore */ }
-          }
-        },
         { label: '关闭', primary: true }
       ]
     });
@@ -1344,6 +1394,7 @@
     await hydrateApp(roche);
 
     var filter = 'all';
+    var kindFilter = 'all';
 
     var root = el('div', { class: 'rtc-root', 'data-theme': currentTheme() });
     var subEl = el('p', { class: 'rtc-sub' });
@@ -1381,6 +1432,24 @@
     var rangeBtn = el('button', { class: 'rtc-rangebtn', type: 'button', text: '今天' });
     rangeBtn.addEventListener('click', function () { openSettings(roche, render); });
 
+    var kindChipsEl = el('div', { class: 'rtc-chips' });
+    KIND_FILTERS.forEach(function (pair) {
+      var btn = el('button', {
+        class: 'rtc-chip' + (pair[0] === kindFilter ? ' is-active' : ''),
+        type: 'button',
+        text: pair[1],
+        'data-kind': pair[0]
+      });
+      btn.addEventListener('click', function () {
+        kindFilter = pair[0];
+        Array.prototype.forEach.call(kindChipsEl.children, function (node) {
+          node.classList.toggle('is-active', node.getAttribute('data-kind') === kindFilter);
+        });
+        renderList();
+      });
+      kindChipsEl.appendChild(btn);
+    });
+
     var priceBar = el('p', { class: 'rtc-pricebar' });
 
     function applyTheme() {
@@ -1408,17 +1477,9 @@
         'V4 Pro 命中 ¥' + p.hit[band] + ' · 未命中 ¥' + p.miss[band] + ' · 输出 ¥' + p.out[band];
     }
 
-    function filterRecords(list) {
-      return list.filter(function (rec) {
-        if (filter === 'hit') return num(rec.hit) > 0;
-        if (filter === 'fail') return !rec.ok;
-        return true;
-      });
-    }
-
     function renderList() {
       var range = resolveRange(settings, Date.now());
-      var list = filterRecords(recordsIn(range.from, range.to));
+      var list = applyFilters(recordsIn(range.from, range.to), filter, kindFilter);
       var cleared = purgedCallsIn(range.from, range.to);
 
       listEl.replaceChildren();
@@ -1463,6 +1524,7 @@
     root.appendChild(el('div', { class: 'rtc-body' }, [
       summaryEl,
       el('div', { class: 'rtc-toolbar' }, [chipsEl, rangeBtn]),
+      el('div', { class: 'rtc-toolbar rtc-toolbar--kinds' }, [kindChipsEl]),
       listEl,
       footerEl,
       priceBar,
