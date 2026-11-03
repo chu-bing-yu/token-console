@@ -1,5 +1,5 @@
 /*!
- * token-console v1.1.0 — Roche 插件
+ * token-console v1.2.0 — Roche 插件
  * Token 账单：观察页面发往 AI 服务的请求（模型、输入/输出 token、DeepSeek 缓存命中、预估费用、调用位置）。
  * 只记录请求元信息（地址、模型、token 数、调用栈文件名/行号），不保存对话正文，不保存 API Key。
  * 价格：DeepSeek 官方公布价（元 / 百万 tokens），按北京时间高峰 / 空闲自动切换。
@@ -7,7 +7,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
   var STYLE_ID = 'rtc-style';
   var LOG_KEY = 'logs';
   var PURGED_KEY = 'purged';
@@ -472,6 +472,25 @@
     return m ? m[1] : '';
   }
 
+  /** 请求体像不像一次 LLM 调用：有 model 字段 + messages/contents/prompt/input */
+  function looksLikeLlmBody(text) {
+    if (!text) return false;
+    var s = String(text);
+    if (s.length > 3145728) return false;
+    var data = null;
+    if (s.charAt(0) === '{') {
+      try { data = JSON.parse(s); } catch (e) { data = null; }
+    }
+    if (data && typeof data === 'object') {
+      var hasModel = typeof data.model === 'string' && !!data.model;
+      var hasMsgs = Array.isArray(data.messages) || Array.isArray(data.contents) ||
+        typeof data.prompt === 'string' || typeof data.input === 'string';
+      return hasModel && hasMsgs;
+    }
+    return /"model"\s*:\s*"[^"]{1,80}"/.test(s) &&
+      (/"messages"\s*:/.test(s) || /"contents"\s*:/.test(s) || /"prompt"\s*:/.test(s));
+  }
+
   function promptTokensFromBody(body) {
     if (!body) return { tokens: 0, messages: 0 };
     var data = null;
@@ -626,12 +645,11 @@
 
   var hooked = false;
 
-  function applyResponseText(rec, text) {
-    var parsed = parseResponse(text);
+  function applyParsed(rec, parsed, usage) {
     if (parsed.model) rec.model = rec.model || parsed.model;
     rec.deepseek = isDeepseek(rec.host, rec.model);
     rec.cls = clsOf(rec.model);
-    var u = normalizeUsage(parsed.usage);
+    var u = usage;
     if (u && (u.prompt || u.out)) {
       rec.prompt = u.prompt || rec.prompt;
       rec.hit = u.hit;
@@ -646,11 +664,49 @@
     }
   }
 
+  function applyResponseText(rec, text) {
+    var parsed = parseResponse(text);
+    applyParsed(rec, parsed, normalizeUsage(parsed.usage));
+  }
+
   function finalize(rec) {
+    if (rec.done) return;
+    rec.done = true;
     rec.elapsedMs = Math.max(0, Date.now() - rec.at);
     rec.cost = computeCost(rec);
     rec.id = 'r_' + rec.at.toString(36) + Math.random().toString(36).slice(2, 6);
     pushRecord(rec);
+  }
+
+  function makeRec(method, url, startedAt) {
+    var path = pathOf(url);
+    return {
+      at: startedAt,
+      url: absolute(url),
+      host: hostOf(url),
+      path: path,
+      method: String(method || 'GET').toUpperCase(),
+      frames: callFrames(),
+      kind: kindOf(path),
+      status: 0,
+      ok: true,
+      stream: false,
+      model: '',
+      deepseek: false,
+      cls: 'flash',
+      peak: isPeak(startedAt),
+      prompt: 0,
+      hit: 0,
+      miss: 0,
+      out: 0,
+      messages: 0,
+      estimated: true,
+      elapsedMs: 0,
+      cost: null,
+      error: '',
+      tentative: false,
+      needsUsage: false
+    };
   }
 
   function collect(rec, bodyPromise, resPromise) {
@@ -665,93 +721,149 @@
       rec.miss = promptInfo.tokens;
       rec.messages = promptInfo.messages;
 
+      // 探测请求：请求体不像 LLM 时，只有响应带 usage 才确认是 AI 调用
+      var bodyLooksLlm = looksLikeLlmBody(bodyText);
+      if (rec.tentative) {
+        if (bodyLooksLlm) rec.tentative = false;
+        else rec.needsUsage = true;
+      }
+
       return Promise.resolve(resPromise).then(function (res) {
         rec.status = res && res.status ? res.status : 0;
         rec.ok = !!(res && res.ok);
+
         // 生图、语音返回二进制，读 body 只为浪费内存，直接记元信息
         if (rec.kind === 'image' || rec.kind === 'tts') {
+          if (rec.needsUsage) return null;
           rec.estimated = false;
           finalize(rec);
           return null;
         }
+
         var clone = null;
         try {
           clone = res && typeof res.clone === 'function' ? res.clone() : null;
         } catch (e) { clone = null; }
         if (!clone || typeof clone.text !== 'function') {
-          finalize(rec);
+          if (!rec.needsUsage) finalize(rec);
           return null;
         }
+
+        // 探测请求别去读超大响应
+        if (rec.needsUsage) {
+          var len = Number(res && res.headers && res.headers.get('content-length')) || 0;
+          if (len > 3145728) return null;
+        }
+
         return clone.text().then(function (text) {
-          applyResponseText(rec, text);
+          var parsed = parseResponse(text);
+          var u = normalizeUsage(parsed.usage);
+          if (rec.needsUsage && !u) return null; // 不是 AI 接口，丢弃
+          applyParsed(rec, parsed, u);
           finalize(rec);
         }, function () {
-          finalize(rec);
+          if (!rec.needsUsage) finalize(rec);
         });
       });
     }).catch(function (err) {
+      if (rec.needsUsage) return;
       rec.ok = false;
       rec.error = String((err && err.message) || err || '请求失败').slice(0, 120);
       finalize(rec);
     });
   }
 
+  var hookedXhr = false;
+
+  /** 有些插件用 axios/XHR 自己调 AI，把 XHR 也补上 */
+  function installXhrHook() {
+    if (hookedXhr) return;
+    var proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (!proto || proto.__rtcHooked || typeof proto.open !== 'function' || typeof proto.send !== 'function') return;
+    hookedXhr = true;
+
+    var openOrig = proto.open;
+    var sendOrig = proto.send;
+
+    proto.open = function (method, url) {
+      try {
+        this.__rtcInfo = { method: String(method || 'GET').toUpperCase(), url: String(url || '') };
+      } catch (e) { /* ignore */ }
+      return openOrig.apply(this, arguments);
+    };
+
+    proto.send = function (body) {
+      var xhr = this;
+      var info = xhr.__rtcInfo;
+      if (info && isAiRequest(info.url)) {
+        var startedAt = Date.now();
+        var rec = makeRec(info.method, info.url, startedAt);
+        rec.prompt = promptTokensFromBody(typeof body === 'string' ? body : '').tokens;
+        rec.miss = rec.prompt;
+        var done = false;
+        var onDone = function () {
+          if (done) return;
+          done = true;
+          rec.status = xhr.status || 0;
+          rec.ok = xhr.status >= 200 && xhr.status < 300;
+          var text = '';
+          try {
+            if (rec.kind !== 'image' && rec.kind !== 'tts' && typeof xhr.responseText === 'string') {
+              text = xhr.responseText;
+            }
+          } catch (e) { text = ''; }
+          applyResponseText(rec, text);
+          finalize(rec);
+        };
+        try { xhr.addEventListener('loadend', onDone); } catch (e) { /* ignore */ }
+      }
+      return sendOrig.apply(this, arguments);
+    };
+
+    proto.__rtcHooked = true;
+  }
+
   function installHook() {
-    if (hooked) return;
+    if (hooked) { installXhrHook(); return; }
     if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
     var orig = window.fetch;
-    if (orig.__rtcHooked) { hooked = true; return; }
+    if (orig.__rtcHooked) { hooked = true; installXhrHook(); return; }
     hooked = true;
 
     var patched = function (input, init) {
       var url = urlOf(input);
-      if (!isAiRequest(url)) return orig.call(this, input, init);
-
+      var method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
       var startedAt = Date.now();
-      var path = pathOf(url);
-      var rec = {
-        at: startedAt,
-        url: absolute(url),
-        host: hostOf(url),
-        path: path,
-        method: String((init && init.method) || (input && input.method) || 'GET').toUpperCase(),
-        frames: callFrames(),
-        kind: kindOf(path),
-        status: 0,
-        ok: true,
-        stream: false,
-        model: '',
-        deepseek: false,
-        cls: 'flash',
-        peak: isPeak(startedAt),
-        prompt: 0,
-        hit: 0,
-        miss: 0,
-        out: 0,
-        messages: 0,
-        estimated: true,
-        elapsedMs: 0,
-        cost: null,
-        error: ''
-      };
 
-      var bodyPromise = readBody(input, init);
-      var resPromise;
-      try {
-        resPromise = orig.call(this, input, init);
-      } catch (err) {
-        rec.ok = false;
-        rec.error = String((err && err.message) || err || '请求失败').slice(0, 120);
-        finalize(rec);
-        throw err;
+      if (isAiRequest(url)) {
+        var rec = makeRec(method, url, startedAt);
+        var bodyPromise = readBody(input, init);
+        var resPromise;
+        try {
+          resPromise = orig.call(this, input, init);
+        } catch (err) {
+          rec.ok = false;
+          rec.error = String((err && err.message) || err || '请求失败').slice(0, 120);
+          finalize(rec);
+          throw err;
+        }
+        collect(rec, bodyPromise, resPromise);
+        return resPromise;
       }
 
-      collect(rec, bodyPromise, resPromise);
-      return resPromise;
+      // 未知域名 / 路径的中转站：POST 时先读请求体，像 LLM 调用就记下来
+      var res = orig.call(this, input, init);
+      if ((method === 'POST' || method === 'PUT') && url) {
+        var probe = makeRec(method, url, startedAt);
+        probe.tentative = true;
+        collect(probe, readBody(input, init), res);
+      }
+      return res;
     };
 
     patched.__rtcHooked = true;
     window.fetch = patched;
+    installXhrHook();
   }
 
   /* ============================== 样式 ============================== */
@@ -1362,6 +1474,17 @@
 
     container.appendChild(root);
 
+    // 兜底铺满：个别机型宿主 h-full 链条断裂导致页面塌陷时，按视口高度补齐
+    function fitFullscreen() {
+      try {
+        var rect = root.getBoundingClientRect();
+        var vh = window.innerHeight || document.documentElement.clientHeight;
+        if (vh && rect.height < vh * 0.6) root.style.height = Math.ceil(vh) + 'px';
+      } catch (e) { /* ignore */ }
+    }
+    fitFullscreen();
+    window.addEventListener('resize', fitFullscreen);
+
     settingsBtn.addEventListener('click', function () { openSettings(roche, render); });
     closeBtn.addEventListener('click', function () {
       if (roche && roche.ui && typeof roche.ui.closeApp === 'function') roche.ui.closeApp();
@@ -1373,6 +1496,7 @@
     return {
       destroy: function () {
         off();
+        window.removeEventListener('resize', fitFullscreen);
         if (saveTimer) {
           clearTimeout(saveTimer);
           saveTimer = 0;
