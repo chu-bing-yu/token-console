@@ -1,5 +1,5 @@
 /*!
- * token-console v1.3.0 — Roche 插件
+ * token-console v1.4.0 — Roche 插件
  * Token 账单：观察页面发往 AI 服务的请求（模型、输入/输出 token、DeepSeek 缓存命中、预估费用、调用位置）。
  * 只记录请求元信息（地址、模型、token 数、调用栈文件名/行号），不保存对话正文，不保存 API Key。
  * 价格：DeepSeek 官方公布价（元 / 百万 tokens），按北京时间高峰 / 空闲自动切换。
@@ -7,11 +7,19 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.3.0';
+  var VERSION = '1.4.0';
   var STYLE_ID = 'rtc-style';
-  var LOG_KEY = 'logs';
-  var PURGED_KEY = 'purged';
-  var SETTINGS_KEY = 'settings';
+  // 存储键按版本隔离：宿主热重载插件时，旧版脚本的 fetch 包装器还活着，
+  // 会继续往它自己版本的键里写；新版只读写自己的键，互不覆盖。
+  var LOG_KEY = 'logs@' + VERSION;
+  var PURGED_KEY = 'purged@' + VERSION;
+  var SETTINGS_KEY = 'settings@' + VERSION;
+  var LEGACY_KEYS = {
+    logs: ['logs', 'logs@1.0.0', 'logs@1.1.0', 'logs@1.2.0', 'logs@1.3.0'],
+    purged: ['purged', 'purged@1.2.0', 'purged@1.3.0'],
+    settings: ['settings', 'settings@1.2.0', 'settings@1.3.0']
+  };
+  var HOOK_FLAG = '__rtcVersion';
   var MAX_LOGS = 300;
   var SELF_SRC = (document.currentScript && document.currentScript.src) || '';
 
@@ -200,13 +208,22 @@
   var app = null;
 
   function normalizeSettings(raw) {
-    var out = { range: 'today', start: '', end: '', theme: 'auto' };
+    var out = {
+      range: 'today', start: '', end: '', theme: 'auto',
+      autoReply: { enabled: false, delaySeconds: 15, onKeyboard: true, nudge: '（请查看并回复上面的新消息）' }
+    };
     if (!raw || typeof raw !== 'object') return out;
     var ranges = ['today', '7d', '30d', 'all', 'custom'];
     out.range = ranges.indexOf(raw.range) !== -1 ? raw.range : 'today';
     out.start = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.start || '')) ? String(raw.start) : '';
     out.end = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.end || '')) ? String(raw.end) : '';
     out.theme = raw.theme === 'light' || raw.theme === 'dark' ? raw.theme : 'auto';
+    var ar = raw.autoReply && typeof raw.autoReply === 'object' ? raw.autoReply : {};
+    out.autoReply.enabled = ar.enabled === true;
+    var delay = Math.round(Number(ar.delaySeconds));
+    out.autoReply.delaySeconds = isFinite(delay) ? Math.min(300, Math.max(3, delay)) : 15;
+    out.autoReply.onKeyboard = ar.onKeyboard !== false;
+    out.autoReply.nudge = String(ar.nudge || out.autoReply.nudge).slice(0, 100);
     return out;
   }
 
@@ -224,6 +241,12 @@
   }
 
   function pushRecord(rec) {
+    // 多层包装 / 自愈重装时防重复：同一请求被链路处理两次时时间戳几乎相同（<10ms）
+    for (var i = 0; i < Math.min(logs.length, 6); i++) {
+      var other = logs[i];
+      if (other && other.url === rec.url && other.method === rec.method &&
+        Math.abs((other.at || 0) - rec.at) < 10) return;
+    }
     logs.unshift(rec);
     if (logs.length > MAX_LOGS) logs.length = MAX_LOGS;
     notify();
@@ -249,38 +272,73 @@
 
   async function readLogsFrom(storageLike) {
     if (!storageLike) return;
-    try {
-      var savedLogs = await storageLike.get(LOG_KEY);
-      if (Array.isArray(savedLogs)) logs = mergeLogs(savedLogs, logs);
-    } catch (e) { /* ignore */ }
+    var sources = [];
+    var keys = LEGACY_KEYS.logs.concat([LOG_KEY]);
+    for (var i = 0; i < keys.length; i++) {
+      try {
+        var v = await storageLike.get(keys[i]);
+        if (Array.isArray(v) && v.length) sources = sources.concat(v);
+      } catch (e) { /* ignore */ }
+    }
+    if (sources.length) logs = mergeLogs(sources, logs);
   }
 
   async function hydrateApp(rocheLike) {
     if (!rocheLike || !rocheLike.storage) return;
     store = rocheLike.storage;
-    await readLogsFrom(store);
+
+    // 旧版本键：读进来合并，然后清掉，避免越积越多
+    for (var i = 0; i < LEGACY_KEYS.logs.length; i++) {
+      try {
+        var oldLogs = await store.get(LEGACY_KEYS.logs[i]);
+        if (Array.isArray(oldLogs) && oldLogs.length) {
+          logs = mergeLogs(oldLogs, logs);
+          await store.delete(LEGACY_KEYS.logs[i]);
+        }
+      } catch (e) { /* ignore */ }
+    }
+    try {
+      var ownLogs = await store.get(LOG_KEY);
+      if (Array.isArray(ownLogs)) logs = mergeLogs(ownLogs, logs);
+    } catch (e) { /* ignore */ }
+
     if (hydratedFull) return;
     hydratedFull = true;
 
-    try {
-      var savedPurged = await store.get(PURGED_KEY);
-      if (savedPurged && typeof savedPurged === 'object' && !Array.isArray(savedPurged)) purged = savedPurged;
-    } catch (e) { /* ignore */ }
+    var purgedKeys = LEGACY_KEYS.purged.concat([PURGED_KEY]);
+    for (var j = 0; j < purgedKeys.length; j++) {
+      try {
+        var bucket = await store.get(purgedKeys[j]);
+        if (bucket && typeof bucket === 'object' && !Array.isArray(bucket)) {
+          Object.keys(bucket).forEach(function (day) {
+            var cur = purged[day];
+            var inc = bucket[day];
+            if (!cur || num(inc && inc.calls) > num(cur.calls)) purged[day] = inc;
+          });
+          if (purgedKeys[j] !== PURGED_KEY) await store.delete(purgedKeys[j]);
+        }
+      } catch (e) { /* ignore */ }
+    }
 
-    try {
-      var savedSettings = await store.get(SETTINGS_KEY);
-      if (savedSettings) settings = normalizeSettings(savedSettings);
-    } catch (e) { /* ignore */ }
+    var settingsKeys = [SETTINGS_KEY].concat(LEGACY_KEYS.settings.slice().reverse());
+    for (var k = 0; k < settingsKeys.length; k++) {
+      try {
+        var savedSettings = await store.get(settingsKeys[k]);
+        if (savedSettings && typeof savedSettings === 'object') {
+          settings = normalizeSettings(savedSettings);
+          break;
+        }
+      } catch (e) { /* ignore */ }
+    }
   }
 
   /** 「+」面板只读：不清空全局 store，避免写到别的存储作用域 */
   async function hydrateReadOnly(rocheLike) {
     if (!rocheLike || !rocheLike.storage) return;
-    var storageLike = rocheLike.storage;
-    await readLogsFrom(storageLike);
+    await readLogsFrom(rocheLike.storage);
     if (hydratedFull) return;
     try {
-      var savedPurged = await storageLike.get(PURGED_KEY);
+      var savedPurged = await rocheLike.storage.get(PURGED_KEY);
       if (savedPurged && typeof savedPurged === 'object' && !Array.isArray(savedPurged)) purged = savedPurged;
     } catch (e) { /* ignore */ }
   }
@@ -802,12 +860,20 @@
   }
 
   var hookedXhr = false;
+  var patchedRef = null;
+  var recentPosts = [];
+
+  /** 诊断：最近 POST/PUT 的判定结果（内存，重载后清空），在设置里可看 */
+  function noteRecent(url, verdict) {
+    recentPosts.unshift({ at: Date.now(), url: String(url || '').slice(0, 90), verdict: verdict });
+    if (recentPosts.length > 30) recentPosts.length = 30;
+  }
 
   /** 有些插件用 axios/XHR 自己调 AI，把 XHR 也补上 */
   function installXhrHook() {
     if (hookedXhr) return;
     var proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
-    if (!proto || proto.__rtcHooked || typeof proto.open !== 'function' || typeof proto.send !== 'function') return;
+    if (!proto || proto.__rtcVersion === VERSION || typeof proto.open !== 'function' || typeof proto.send !== 'function') return;
     hookedXhr = true;
 
     var openOrig = proto.open;
@@ -849,13 +915,23 @@
     };
 
     proto.__rtcHooked = true;
+    proto[HOOK_FLAG] = VERSION;
   }
 
+  /**
+   * 安装拦截。宿主热重载插件时页面不刷新，旧版包装器还挂在 window.fetch 上，
+   * 这里按版本号判断：同版本跳过；旧版本的包装器留着（它写自己的旧状态），新包装器叠在外面，
+   * 保证最新版 UI 一定收得到记录；链路被别人重置时（window.fetch 上没有我们的标记）重新装。
+   */
   function installHook() {
-    if (hooked) { installXhrHook(); return; }
     if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
     var orig = window.fetch;
-    if (orig.__rtcHooked) { hooked = true; installXhrHook(); return; }
+    if (orig && orig[HOOK_FLAG] === VERSION) {
+      hooked = true;
+      patchedRef = orig;
+      installXhrHook();
+      return;
+    }
     hooked = true;
 
     var patched = function (input, init) {
@@ -864,6 +940,7 @@
       var startedAt = Date.now();
 
       if (isAiRequest(url)) {
+        noteRecent(url, '记为AI');
         var rec = makeRec(method, url, startedAt);
         var bodyPromise = readBody(input, init);
         var resPromise;
@@ -879,6 +956,10 @@
         return resPromise;
       }
 
+      if (method === 'POST' || method === 'PUT') {
+        noteRecent(url, url ? '探测' : '忽略');
+      }
+
       // 未知域名 / 路径的中转站：POST 时先读请求体，像 LLM 调用就记下来
       var res = orig.call(this, input, init);
       if ((method === 'POST' || method === 'PUT') && url) {
@@ -890,9 +971,18 @@
     };
 
     patched.__rtcHooked = true;
+    patched[HOOK_FLAG] = VERSION;
     window.fetch = patched;
+    patchedRef = patched;
     installXhrHook();
   }
+
+  // 自愈：链路被别的代码重置时重新装回（5 秒检查一次）
+  setInterval(function () {
+    try {
+      if (window.fetch && !window.fetch.__rtcHooked) installHook();
+    } catch (e) { /* ignore */ }
+  }, 5000);
 
   /* ============================== 样式 ============================== */
 
@@ -1195,6 +1285,10 @@
 
   async function openBill(roche) {
     await hydrateReadOnly(roche);
+    if (roche) {
+      runtime.roche = roche;
+      startAutoReply();
+    }
 
     var now = Date.now();
     var range = { from: dayStart(now), to: dayEnd(now), label: '今天' };
@@ -1272,6 +1366,104 @@
   }
 
   /* ============================== 设置 ============================== */
+
+  function buildAutoReplyField(apply) {
+    var cfg = normalizeSettings({ autoReply: settings.autoReply }).autoReply;
+    var wrap = el('div', { class: 'rtc-field' });
+    var statusText = autoStatus.lastError
+      ? '出错：' + autoStatus.lastError
+      : autoStatus.lastFireAt
+        ? '上次触发 ' + fmtClock(autoStatus.lastFireAt)
+        : '还没触发过';
+    wrap.appendChild(el('div', { class: 'rtc-field__label' }, [
+      el('span', { text: '自动催回复（实验性）' }),
+      el('span', { text: statusText })
+    ]));
+
+    var chips = el('div', { class: 'rtc-chips' });
+    [['off', '关闭'], ['on', '开启']].forEach(function (pair) {
+      var btn = el('button', {
+        class: 'rtc-chip' + ((pair[0] === 'on') === cfg.enabled ? ' is-active' : ''),
+        type: 'button',
+        text: pair[1]
+      });
+      btn.addEventListener('click', function () {
+        apply({ autoReply: Object.assign({}, settings.autoReply, { enabled: pair[0] === 'on' }) });
+        Array.prototype.forEach.call(chips.children, function (node, i) {
+          node.classList.toggle('is-active', i === (pair[0] === 'on' ? 1 : 0));
+        });
+      });
+      chips.appendChild(btn);
+    });
+    wrap.appendChild(chips);
+
+    var delayInput = el('input', { class: 'rtc-input', type: 'number', min: '3', max: '300', step: '1' });
+    delayInput.value = String(cfg.delaySeconds);
+    delayInput.addEventListener('change', function () {
+      apply({ autoReply: Object.assign({}, settings.autoReply, { delaySeconds: Number(delayInput.value) || 15 }) });
+    });
+    var delayRow = el('div', { class: 'rtc-daterow' }, [
+      el('span', { text: '延迟' }),
+      delayInput,
+      el('span', { text: '秒后触发（3-300）' })
+    ]);
+    if (!cfg.enabled) delayRow.style.display = 'none';
+    wrap.appendChild(delayRow);
+
+    var kbChips = el('div', { class: 'rtc-chips' });
+    [[true, '收起键盘立即触发'], [false, '忽略键盘']].forEach(function (pair) {
+      var btn = el('button', {
+        class: 'rtc-chip' + (pair[0] === cfg.onKeyboard ? ' is-active' : ''),
+        type: 'button',
+        text: pair[1]
+      });
+      btn.addEventListener('click', function () {
+        apply({ autoReply: Object.assign({}, settings.autoReply, { onKeyboard: pair[0] }) });
+        Array.prototype.forEach.call(kbChips.children, function (node, i) {
+          node.classList.toggle('is-active', [true, false][i] === pair[0]);
+        });
+      });
+      kbChips.appendChild(btn);
+    });
+    if (!cfg.enabled) kbChips.style.display = 'none';
+    wrap.appendChild(kbChips);
+    kbChips.style.marginTop = '8px';
+
+    var nudgeInput = el('input', { class: 'rtc-input', type: 'text' });
+    nudgeInput.value = cfg.nudge;
+    nudgeInput.addEventListener('change', function () {
+      apply({ autoReply: Object.assign({}, settings.autoReply, { nudge: nudgeInput.value }) });
+    });
+    if (!cfg.enabled) {
+      nudgeInput.style.display = 'none';
+      delayRow.style.display = 'none';
+    }
+    wrap.appendChild(nudgeInput);
+    nudgeInput.style.marginTop = '8px';
+
+    wrap.appendChild(el('p', {
+      class: 'rtc-note',
+      text: '用户在主聊天发出消息后，按「键盘收起」或「延迟秒数」先到者触发；实现方式是发一条系统提醒消息，是否因此生成回复由宿主决定。需要先打开过一次本插件。'
+    }));
+    return wrap;
+  }
+
+  function buildDiagField() {
+    var wrap = el('div', { class: 'rtc-field' });
+    wrap.appendChild(el('div', { class: 'rtc-field__label' }, [
+      el('span', { text: '最近请求诊断' }),
+      el('span', { text: '内存数据，重载后清空' })
+    ]));
+    var lines = recentPosts.map(function (item) {
+      return fmtClock(item.at) + ' ' + item.verdict + ' ' + item.url;
+    });
+    wrap.appendChild(el('div', {
+      class: 'rtc-row__detail',
+      style: 'display:block;margin-top:0;max-height:150px;overflow-y:auto;',
+      text: lines.length ? lines.join('\n') : '还没有 POST 请求经过'
+    }));
+    return wrap;
+  }
 
   function openSettings(roche, onChange) {
     var draft = normalizeSettings(settings);
@@ -1381,6 +1573,9 @@
             text: '只删除明细行，调用次数与 token 数会保留在统计里。'
           })
         ]));
+
+        body.appendChild(buildAutoReplyField(apply));
+        body.appendChild(buildDiagField());
       },
       actions: [{ label: '完成', primary: true }]
     });
@@ -1388,10 +1583,84 @@
     refresh();
   }
 
+  /* ============================== 自动催回复（实验性） ============================== */
+
+  var runtime = { roche: null };
+  var autoTimer = 0;
+  var lastHandledAt = Date.now();
+  var lastNudgeAt = 0;
+  var keyboardCollapsedAt = 0;
+  var vvPrevHeight = 0;
+  var autoStatus = { lastFireAt: 0, lastError: '' };
+
+  /**
+   * 宿主没有公开「触发主聊天回复」的 API，这里用系统提醒消息来催。
+   * 监听：轮询最近会话的最后一条消息是不是用户发的；触发时机：键盘收起（visualViewport 变高）或延迟 N 秒。
+   */
+  function startAutoReply() {
+    watchKeyboard();
+    if (autoTimer) return;
+    autoTimer = setInterval(function () { pollAutoReply(); }, 3000);
+  }
+
+  function watchKeyboard() {
+    try {
+      var vv = window.visualViewport;
+      if (!vv || vv.__rtcWatched) return;
+      vv.__rtcWatched = true;
+      vvPrevHeight = vv.height;
+      vv.addEventListener('resize', function () {
+        try {
+          var h = vv.height;
+          if (vvPrevHeight && h - vvPrevHeight > 120) keyboardCollapsedAt = Date.now();
+          vvPrevHeight = h;
+        } catch (e) { /* ignore */ }
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  function isMineMessage(m) {
+    return !!m && (m.isMe === true || m.role === 'user' || m.senderId === 'me' || m.senderId === 'user');
+  }
+
+  async function pollAutoReply() {
+    var roche = runtime.roche;
+    var cfg = settings.autoReply;
+    if (!roche || !cfg || !cfg.enabled) return;
+    var now = Date.now();
+    try {
+      var convs = await roche.conversation.list();
+      if (!convs || !convs.length) return;
+      var conv = convs[0];
+      var convId = conv && (conv.id || conv.conversationId);
+      if (!convId) return;
+      var msgs = await roche.memory.getShortTerm({ conversationId: convId, limit: 5 });
+      if (!msgs || !msgs.length) return;
+      var last = msgs[msgs.length - 1];
+      if (!isMineMessage(last)) return;
+      var ts = Number(last.timestamp) || 0;
+      if (!ts || ts <= lastHandledAt) return;
+      if (now - ts > 10 * 60000) { lastHandledAt = ts; return; } // 太旧的消息不追
+      var byKeyboard = cfg.onKeyboard && keyboardCollapsedAt > ts;
+      if (!byKeyboard && now - ts < cfg.delaySeconds * 1000) return;
+      if (now - lastNudgeAt < 30000) return; // 冷却，避免连发
+
+      lastHandledAt = ts;
+      lastNudgeAt = now;
+      await roche.chat.sendMessage({ conversationId: convId, kind: 'system', text: cfg.nudge });
+      autoStatus.lastFireAt = now;
+      autoStatus.lastError = '';
+    } catch (e) {
+      autoStatus.lastError = String((e && e.message) || e || '触发失败').slice(0, 80);
+    }
+  }
+
   /* ============================== App 页面 ============================== */
 
   async function createView(container, roche) {
     await hydrateApp(roche);
+    runtime.roche = roche;
+    startAutoReply();
 
     var filter = 'all';
     var kindFilter = 'all';
